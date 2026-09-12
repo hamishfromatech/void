@@ -301,3 +301,12 @@ These incredible projects provide the foundation upon which A-Coder IDE is built
 ---
 
 *A-Coder IDE is proudly open-source, built for developers, by developers.*
+
+## License
+
+Dual-licensed by The A-Tech Corporation PTY LTD:
+
+- **Free** for individuals, solo founders, and businesses with less than USD $10M in total annual revenue — free and open source, forever.
+- **The A-Tech Corporation License** required for organizations with USD $10M or more in annual revenue deploying A-Coder across departments and users. Contact [The A-Tech Corporation](https://theatechcorporation.com).
+
+See [LICENSE.txt](LICENSE.txt) for full terms.

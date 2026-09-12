@@ -199,3 +199,28 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+
+--------------------------------------------------------------------------------
+A-TECH DISTRIBUTION TERMS — DUAL LICENSE
+--------------------------------------------------------------------------------
+
+A-Coder is distributed by The A-Tech Corporation under a dual license:
+
+1.  FREE LICENSE — Individuals, solo founders, and businesses with less than
+    USD $10,000,000 in total annual revenue (including parent companies,
+    subsidiaries, and affiliates) may use, modify, and redistribute this
+    software free of charge, under the license above.
+
+2.  THE A-TECH CORPORATION LICENSE — Businesses with USD $10,000,000 or more
+    in total annual revenue require The A-Tech Corporation License to deploy
+    or use this software across their departments and users. The license may
+    be obtained from The A-Tech Corporation: https://theatechcorporation.com
+
+    Enterprise licensing: https://theatechcorporation.com
+
+This notice applies to software distributed by The A-Tech Corporation and
+does not modify the original license grant made by the copyright holders
+above. Third-party components remain under their own respective licenses.
+
+Copyright (c) 2026 The A-Tech Corporation PTY LTD. Made in Australia.
