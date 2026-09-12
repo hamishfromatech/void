@@ -57,6 +57,11 @@ interface GeminiStreamChunkExtras {
 		finishReason?: string
 		content?: { parts?: Array<{ thought?: boolean, text?: string }> }
 	}>
+	usageMetadata?: {
+		promptTokenCount?: number
+		candidatesTokenCount?: number
+		totalTokenCount?: number
+	}
 }
 interface GeminiFunctionCallExtras {
 	thought_signature?: string
@@ -1554,7 +1559,18 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 		const finalToolCalls = tools.map(t => rawToolCallObjOfAnthropicParams(t)).filter(tc => !!tc) as RawToolCallObj[]
 		const toolCallObj = finalToolCalls.length > 0 ? { toolCalls: finalToolCalls } : {}
 
-		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, ...toolCallObj, stopReason: response.stop_reason ?? undefined })
+		// Capture real token usage so callers can anchor context-size accounting
+		// on it instead of re-estimating the entire prompt. Anthropic's
+		// `input_tokens` EXCLUDES cache hits, so add cache reads/creations back in
+		// to get the true prompt size (what matters for context-window math).
+		const u = response.usage
+		const usage = u ? {
+			promptTokens: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+			completionTokens: u.output_tokens ?? 0,
+			...(typeof u.cache_read_input_tokens === 'number' ? { cachedTokens: u.cache_read_input_tokens } : {}),
+		} : undefined
+
+		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, ...toolCallObj, usage, stopReason: response.stop_reason ?? undefined })
 	})
 	// on error
 	stream.on('error', (error) => {
@@ -1883,6 +1899,9 @@ const sendGeminiChat = async ({
 
 	let toolCallsAccumulator: { name: string, id: string, paramsStr: string, thoughtSignature?: string }[] = []
 	let lastGeminiFinishReason: string | undefined
+	// Real token usage from the final chunk's usageMetadata, used to anchor
+	// context-size accounting instead of re-estimating the whole prompt.
+	let finalGeminiUsage: { promptTokens: number; completionTokens: number } | undefined
 
 
 	genAI.models.generateContentStream({
@@ -1907,6 +1926,14 @@ const sendGeminiChat = async ({
 			const candidates = (chunk as unknown as GeminiStreamChunkExtras).candidates
 			if (candidates?.[0]?.finishReason) {
 				lastGeminiFinishReason = candidates[0].finishReason
+			}
+			// Capture the last reported usage — Gemini streams it on most chunks.
+			const geminiUsageMeta = (chunk as unknown as GeminiStreamChunkExtras).usageMetadata
+			if (geminiUsageMeta && (geminiUsageMeta.promptTokenCount ?? 0) > 0) {
+				finalGeminiUsage = {
+					promptTokens: geminiUsageMeta.promptTokenCount ?? 0,
+					completionTokens: geminiUsageMeta.candidatesTokenCount ?? 0,
+				}
 			}
 			if (candidates?.[0]?.content?.parts?.forEach) {
 				for (const part of candidates[0].content.parts) {
@@ -1956,7 +1983,7 @@ const sendGeminiChat = async ({
 				const finalToolCalls = toolCallsAccumulator.map(tc => rawToolCallObjOfParamsStr(tc.name, tc.paramsStr, tc.id || generateUuid(), tc.thoughtSignature)).filter(tc => !!tc) as RawToolCallObj[]
 				const toolCallObj = finalToolCalls.length > 0 ? { toolCalls: finalToolCalls } : {}
 				const anthropicReasoning: AnthropicReasoning[] | null = fullReasoningSoFar ? [{ type: 'thinking', thinking: fullReasoningSoFar, signature: toolCallsAccumulator[0]?.thoughtSignature || '' }] : null
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning, ...toolCallObj, stopReason: lastGeminiFinishReason });
+				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning, ...toolCallObj, usage: finalGeminiUsage, stopReason: lastGeminiFinishReason });
 			}
 		})
 		.catch(error => {

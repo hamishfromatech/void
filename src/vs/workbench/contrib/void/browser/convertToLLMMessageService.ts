@@ -43,6 +43,24 @@ export type SimpleLLMMessage = {
 	anthropicReasoning: AnthropicReasoning[] | null;
 }
 
+/**
+ * A real prompt-usage measurement from the last successful LLM call, used to
+ * anchor context-size accounting (ported from a-coder-cli's compaction design):
+ * instead of re-tokenizing the entire thread on every message, we take the
+ * measured `promptTokens` as ground truth for the covered prefix and only
+ * cheaply estimate the trailing messages added since.
+ */
+export type UsageAnchor = {
+	/** Measured prompt tokens (system message + converted thread messages). */
+	promptTokens: number
+	/** Number of thread ChatMessages the measurement covered. */
+	coveredThreadMessageCount: number
+	/** Compaction snapshot count at measurement time — anchor is invalid if this changed. */
+	compactedChatMessageCountAtAnchor: number
+	providerName: string
+	modelName: string
+}
+
 
 
 const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
@@ -603,7 +621,7 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, loadedSkills?: { [name: string]: string }, orchestrationResult?: { suggestions: Array<{ toolName: string; toolParams?: Record<string, unknown>; reasoning: string; confidence: 'high' | 'medium' | 'low'; }>; reasoning: string; summary: string; }, compaction?: CompactionSnapshot }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, tokenUsage: { used: number, total: number, percentage: number }, compressionStats?: { originalMessageCount: number, finalMessageCount: number, originalTokens: number, finalTokens: number, compressionRatio: number, messagesRemoved: number, messagesSummarized: number } }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, loadedSkills?: { [name: string]: string }, orchestrationResult?: { suggestions: Array<{ toolName: string; toolParams?: Record<string, unknown>; reasoning: string; confidence: 'high' | 'medium' | 'low'; }>; reasoning: string; summary: string; }, compaction?: CompactionSnapshot, usageAnchor?: UsageAnchor }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, tokenUsage: { used: number, total: number, percentage: number }, compressionStats?: { originalMessageCount: number, finalMessageCount: number, originalTokens: number, finalTokens: number, compressionRatio: number, messagesRemoved: number, messagesSummarized: number } }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	updateTokenRatio(modelName: string, estimatedTokens: number, actualTokens: number): void
 	// Builds the system message for a subagent run: the subagent's role prompt
@@ -867,7 +885,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const base = await this._generateChatMessagesSystemMessage('code', specialToolFormat, modelSelection, allowedTools, allowExternalTools)
 		return `${rolePrompt}\n\n${base}`
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, loadedSkills, orchestrationResult, compaction }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, loadedSkills, orchestrationResult, compaction, usageAnchor }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, tokenUsage: { used: 0, total: 0, percentage: 0 }, compressionStats: undefined }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -945,29 +963,45 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// Get reserved tokens calculation
 		const effectiveContext = contextWindowSize - (reservedOutputTokenSpace ?? 4096);
 
-		// Count tokens before compression (with better error handling)
+		// Count tokens before compression. When a real usage anchor from the last
+		// successful LLM call is available and still valid, anchor on its measured
+		// promptTokens and only cheaply estimate the trailing messages — avoiding a
+		// full re-tokenization of the entire thread (IPC count) on every call.
+		const anchor = usageAnchor;
+		const anchorUsable = !!anchor
+			&& anchor.providerName === providerName
+			&& anchor.modelName === modelName
+			&& anchor.promptTokens > 0
+			&& (compaction?.compactedChatMessageCount ?? 0) === anchor.compactedChatMessageCountAtAnchor
+			&& anchor.coveredThreadMessageCount <= chatMessages.length;
+
 		let tokenCount: number;
-		try {
-			tokenCount = await this.tokenCountingService.countMessagesTokensAsync(messages, fullModelName);
-		} catch (error) {
-			// Fallback to estimate
-			tokenCount = Math.ceil(JSON.stringify(messages).length / 4);
+		if (anchorUsable && anchor) {
+			const trailingChatMessages = chatMessages.slice(anchor.coveredThreadMessageCount);
+			const trailingSimple = this._chatMessagesToSimpleMessages(trailingChatMessages);
+			const trailingTokens = this.tokenCountingService.estimateMessagesTokensFast(trailingSimple);
+			tokenCount = anchor.promptTokens + trailingTokens;
+			console.log(`[ConvertToLLMMessageService] Token usage (usage-anchored): ${anchor.promptTokens} + ${trailingTokens} trailing = ${tokenCount}/${effectiveContext} for ${providerName}/${modelName}`);
+		} else {
+			try {
+				tokenCount = await this.tokenCountingService.countMessagesTokensAsync(messages, fullModelName);
+			} catch (error) {
+				// Fallback to estimate
+				tokenCount = Math.ceil(JSON.stringify(messages).length / 4);
+			}
 		}
 
 		const usage = tokenCount / effectiveContext;
-		console.log(`[ConvertToLLMMessageService] Token usage: ${tokenCount}/${effectiveContext} (${(usage * 100).toFixed(1)}%) for ${providerName}/${modelName}`);
+		if (!anchorUsable) {
+			console.log(`[ConvertToLLMMessageService] Token usage: ${tokenCount}/${effectiveContext} (${(usage * 100).toFixed(1)}%) for ${providerName}/${modelName}`);
+		}
 
 		// Compress if using more than 70% of effective context (more aggressive threshold)
-		// Lower threshold = compress earlier = more reliable prevention of overflow
+		// Lower threshold = compress earlier = more reliable prevention of overflow.
+		// Uses the tokenCount computed above (usage-anchored or fully counted) rather
+		// than triggering a second full re-count inside compressionService.
 		const compressionThreshold = 0.70; // 70% instead of 80%
-		
-		let needsCompression = false;
-		try {
-			needsCompression = await this.compressionService.needsCompression(messages, fullModelName, compressionThreshold);
-		} catch (error) {
-			// If compression check fails, still compress if we're clearly over
-			needsCompression = usage > compressionThreshold;
-		}
+		const needsCompression = usage > compressionThreshold;
 
 		let compressionStats = undefined;
 		if (needsCompression) {

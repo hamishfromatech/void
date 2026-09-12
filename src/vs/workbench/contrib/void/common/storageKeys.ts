@@ -19,6 +19,12 @@ export const VOID_SETTINGS_STORAGE_KEY = 'void.settingsServiceStorageII'
 // Current: 1.0.4 - added storage versioning and migration support
 export const THREAD_STORAGE_KEY = 'void.chatThreadStorageIII'
 
+// Per-thread storage (1.0.5): each thread is stored under its own key
+// (`void.chatThread.<threadId>`) so a save only serializes the thread that
+// changed instead of re-stringify-ing every stored thread. The legacy blob key
+// above is kept as a migration source only.
+export const THREAD_STORAGE_KEY_PREFIX = 'void.chatThread.'
+
 // Storage version key - used for migration tracking
 export const THREAD_STORAGE_VERSION_KEY = 'void.chatThreadStorage.version'
 export const CURRENT_THREAD_STORAGE_VERSION = 1

@@ -33,9 +33,11 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot, DiffBasedCheckpoint, createDiffBasedCheckpoint, applyDiffBasedCheckpoint } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { THREAD_STORAGE_KEY, THREAD_STORAGE_VERSION_KEY, CURRENT_THREAD_STORAGE_VERSION } from '../common/storageKeys.js';
+import { THREAD_STORAGE_KEY, THREAD_STORAGE_KEY_PREFIX, THREAD_STORAGE_VERSION_KEY, CURRENT_THREAD_STORAGE_VERSION } from '../common/storageKeys.js';
+import { truncateToolOutputWithNotice } from '../common/truncateToolOutput.js';
+import { AgentLoopEvent } from './agentLoopEvents.js';
 import { IVisionService } from './visionService.js';
-import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { IConvertToLLMMessageService, UsageAnchor } from './convertToLLMMessageService.js';
 import { IToolOrchestrationService, OrchestrationResult } from './toolOrchestrationService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
@@ -81,6 +83,13 @@ const MAX_IMAGES_PER_MESSAGE = 5;
 
 // MEMORY OPTIMIZATION: Maximum message queue size per thread
 const MAX_MESSAGE_QUEUE_PER_THREAD = 10;
+
+// Detection of provider context-length errors, used to decide whether an LLM
+// error should trigger token-ratio adjustment + compression retry. Deliberately
+// narrow: bare substrings like "400" or "token" also match auth failures
+// ("invalid token"), timeouts ("context deadline exceeded"), and unrelated 4xx
+// responses, which previously got misclassified as context-length errors.
+const CONTEXT_LENGTH_ERROR_RE = /maximum context length|context length|context window|prompt is too long|input token count[^.]*exceeds|too many (input )?tokens|exceeds[^.]*tokens? (limit|maximum)|tokens? (limit|maximum)[^.]*exceed|reduce the length|too long/i;
 
 // MEMORY OPTIMIZATION: Maximum total size of all images in a message (10MB)
 const MAX_TOTAL_IMAGE_SIZE_MB = 10;
@@ -998,15 +1007,48 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _readAllThreads(): ChatThreads | null {
-		const threadsStr = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
-		if (!threadsStr) {
-			return null
+		// MIGRATION: older versions stored every thread in one JSON blob. Fan the
+		// blob out into per-thread keys and delete it, so saves become
+		// O(changed thread) instead of O(all threads).
+		const legacyStr = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
+		if (legacyStr) {
+			try {
+				const legacyThreads = this._convertThreadDataFromStorage(legacyStr);
+				for (const [threadId, thread] of Object.entries(legacyThreads)) {
+					if (!thread) continue;
+					const json = this._serializeThreadForStorage(threadId, thread);
+					this._storageService.store(THREAD_STORAGE_KEY_PREFIX + threadId, json, StorageScope.APPLICATION, StorageTarget.USER);
+					this._persistedThreadJson.set(threadId, json);
+				}
+				voidDevLog(`[Storage] Migrated ${Object.keys(legacyThreads).length} thread(s) from legacy blob to per-thread storage`);
+			} catch (e) {
+				voidDevWarn('[Storage] Failed to migrate legacy thread blob:', e);
+			}
+			this._storageService.remove(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
 		}
 
-		const threads = this._convertThreadDataFromStorage(threadsStr);
-		const storedVersion = this._getStorageVersion();
+		// Per-thread storage: enumerate keys and reassemble the map.
+		const perThreadKeys = this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)
+			.filter(key => key.startsWith(THREAD_STORAGE_KEY_PREFIX));
+		if (perThreadKeys.length === 0) return null;
 
-		// Apply migrations if needed
+		const threads: ChatThreads = {};
+		for (const key of perThreadKeys) {
+			const threadId = key.slice(THREAD_STORAGE_KEY_PREFIX.length);
+			const threadsStr = this._storageService.get(key, StorageScope.APPLICATION);
+			if (!threadsStr) continue;
+			try {
+				const single = this._convertThreadDataFromStorage(threadsStr);
+				const thread = single[threadId];
+				if (thread) threads[threadId] = thread;
+			} catch (e) {
+				voidDevWarn(`[Storage] Failed to parse stored thread ${threadId}:`, e);
+			}
+		}
+
+		// Apply data-schema migrations if needed (unchanged semantics from the
+		// legacy blob era — this migrates thread data shapes, not storage layout).
+		const storedVersion = this._getStorageVersion();
 		if (storedVersion < CURRENT_THREAD_STORAGE_VERSION) {
 			voidDevLog(`[Storage] Found threads from version ${storedVersion}, current is ${CURRENT_THREAD_STORAGE_VERSION}`);
 			const migratedThreads = this._migrateThreads(threads, storedVersion);
@@ -1016,7 +1058,21 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			return migratedThreads;
 		}
 
-		return threads
+		return threads;
+	}
+
+	/**
+	 * Serialize a single thread for storage. Wrapped as `{ [threadId]: thread }`
+	 * so `_convertThreadDataFromStorage` (with its URI revival) round-trips it.
+	 * Does not mutate the live thread object.
+	 */
+	private _serializeThreadForStorage(threadId: string, thread: ThreadType): string {
+		const { filesWithUserChanges, ...rest } = thread;
+		const serializable = {
+			...rest,
+			filesWithUserChanges: filesWithUserChanges instanceof Set ? Array.from(filesWithUserChanges) : filesWithUserChanges,
+		};
+		return JSON.stringify({ [threadId]: serializable });
 	}
 
 	private _storeAllThreads(threads: ChatThreads) {
@@ -1040,12 +1096,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			return timeB - timeA; // Descending order (newest first)
 		});
 
-		const prunedThreads: ChatThreads = {};
 		// Keep the most recent threads in storage
-		const threadIdsToKeep = sortedThreadIds.slice(0, this.MAX_THREADS_IN_STORAGE);
-		threadIdsToKeep.forEach(id => {
-			prunedThreads[id] = normalizedThreads[id];
-		});
+		const threadIdsToKeep = new Set(sortedThreadIds.slice(0, this.MAX_THREADS_IN_STORAGE));
 
 		// MEMORY FIX: Clean up auxiliary data for pruned threads
 		const threadIdsToPrune = sortedThreadIds.slice(this.MAX_THREADS_IN_STORAGE);
@@ -1061,28 +1113,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}
 
-		// Convert Sets to Arrays for JSON serialization
-		const serializableThreads: any = {}; // Start with empty object
-		for (const id of threadIdsToKeep) {
-			const thread = normalizedThreads[id];
+		// PER-THREAD PERSISTENCE (ported from a-coder-cli's JSONL approach): each
+		// thread lives under its own storage key, and a save only serializes threads
+		// whose serialized content actually changed — usually exactly one — instead
+		// of stringify-ing the entire stored history on every save.
+		for (const threadId of threadIdsToKeep) {
+			const thread = normalizedThreads[threadId];
 			if (!thread) continue;
-
-			// Clone the thread to avoid modifying the original state
-			const threadClone = { ...thread };
-			if (threadClone.filesWithUserChanges instanceof Set) {
-				threadClone.filesWithUserChanges = Array.from(threadClone.filesWithUserChanges) as any;
-			}
-
-			serializableThreads[id] = threadClone;
+			const json = this._serializeThreadForStorage(threadId, thread);
+			if (this._persistedThreadJson.get(threadId) === json) continue;
+			this._storageService.store(THREAD_STORAGE_KEY_PREFIX + threadId, json, StorageScope.APPLICATION, StorageTarget.USER);
+			this._persistedThreadJson.set(threadId, json);
 		}
 
-		const serializedThreads = JSON.stringify(serializableThreads);
-		this._storageService.store(
-			THREAD_STORAGE_KEY,
-			serializedThreads,
-			StorageScope.APPLICATION,
-			StorageTarget.USER
-		);
+		// Threads that were deleted or pruned: drop their storage keys.
+		for (const threadId of Array.from(this._persistedThreadJson.keys())) {
+			if (!threadIdsToKeep.has(threadId)) {
+				this._storageService.remove(THREAD_STORAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION);
+				this._persistedThreadJson.delete(threadId);
+			}
+		}
 	}
 
 	private _ensureThreadStateDefaults(threads: ChatThreads): ChatThreads {
@@ -1094,7 +1144,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 			nextThreads[threadId] = {
 				...thread,
-				filesWithUserChanges: new Set(Array.isArray(thread.filesWithUserChanges) ? thread.filesWithUserChanges : []),
+				filesWithUserChanges: thread.filesWithUserChanges instanceof Set
+					? thread.filesWithUserChanges
+					: new Set(Array.isArray(thread.filesWithUserChanges) ? thread.filesWithUserChanges : []),
 				state: {
 					...thread.state,
 					autoContinueEnabled: thread.state?.autoContinueEnabled ?? false,
@@ -1433,6 +1485,28 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 	// TOON service for compressing large tool results
 	private readonly _toonService = new ToonService();
 
+	// USAGE ANCHORING: last real prompt usage per thread, from the most recent
+	// successful LLM call. Lets prepareLLMChatMessages anchor on measured tokens
+	// and only estimate trailing messages instead of re-tokenizing everything.
+	// Ephemeral (not persisted) — a cold start falls back to a full count.
+	private readonly usageAnchorByThreadId = new Map<string, UsageAnchor>();
+
+	// PER-THREAD PERSISTENCE: last-persisted serialized JSON per thread, used to
+	// skip re-writing threads whose content did not change since the last save.
+	private readonly _persistedThreadJson = new Map<string, string>();
+
+	// AGENT LOOP EVENTS: typed, observational events for loop transitions (see
+	// agentLoopEvents.ts). Emission never throws into the loop.
+	private readonly _onAgentLoopEvent = new Emitter<AgentLoopEvent>();
+	readonly onAgentLoopEvent = this._onAgentLoopEvent.event;
+	private _emitAgentEvent(event: AgentLoopEvent): void {
+		try {
+			this._onAgentLoopEvent.fire(event);
+		} catch (e) {
+			voidDevWarn('[chatThreadService] agent loop event subscriber threw:', e)
+		}
+	}
+
 	private readonly toolErrMsgs = {
 		rejected: 'Tool call was rejected by the user.',
 		interrupted: 'Tool call was interrupted by the user.',
@@ -1452,22 +1526,21 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 	private toolResultCache: { [threadId: string]: Map<string, { resultStr: string, result: ToolResult<ToolName> }> } = {};
 
 	private _truncateToolResult(result: any): any {
+		// TWO-LIMIT TRUNCATION (ported from a-coder-cli): independent line + byte
+		// limits, whichever is hit first, always cutting on a line boundary so
+		// line-number references stay intact. The old substring() cut could split
+		// a line mid-row and corrupt line-numbered output (read_file etc.).
 		if (typeof result === 'string') {
-			if (result.length > MAX_TOOL_RESULT_LENGTH) {
-				return result.substring(0, MAX_TOOL_RESULT_LENGTH) + `... (truncated to ${MAX_TOOL_RESULT_LENGTH} characters)`;
-			}
-			return result;
+			return truncateToolOutputWithNotice(result, { maxBytes: MAX_TOOL_RESULT_LENGTH });
 		}
 
 		if (result && typeof result === 'object') {
 			// If it's a ToolResult object (e.g. from read_file)
 			if ('content' in result && typeof result.content === 'string') {
-				if (result.content.length > MAX_TOOL_RESULT_LENGTH) {
-					return {
-						...result,
-						content: result.content.substring(0, MAX_TOOL_RESULT_LENGTH) + `... (truncated to ${MAX_TOOL_RESULT_LENGTH} characters)`
-					};
-				}
+				return {
+					...result,
+					content: truncateToolOutputWithNotice(result.content, { maxBytes: MAX_TOOL_RESULT_LENGTH })
+				};
 			}
 
 			// Handle MCP tool results which often have a 'content' array
@@ -1476,9 +1549,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 					...result,
 					content: result.content.map((item: any) => {
 						if (item && typeof item === 'object' && 'text' in item && typeof item.text === 'string') {
-							if (item.text.length > MAX_TOOL_RESULT_LENGTH) {
-								return { ...item, text: item.text.substring(0, MAX_TOOL_RESULT_LENGTH) + `... (truncated to ${MAX_TOOL_RESULT_LENGTH} characters)` };
-							}
+							return { ...item, text: truncateToolOutputWithNotice(item.text, { maxBytes: MAX_TOOL_RESULT_LENGTH }) };
 						}
 						return item;
 					})
@@ -1669,6 +1740,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 		const progressMessage = this.getPredictiveProgressMessage(toolName, toolParams);
 		const runningTool = { role: 'tool', type: 'running_now', name: toolName, params: toolParams, content: progressMessage, result: null, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, thought_signature: opts.thought_signature, parallelBatchId } as const
 		this._updateToolMessage(threadId, runningTool, !!parallelMode)
+		this._emitAgentEvent({ type: 'tool_execution_started', threadId, toolName })
 
 		let interrupted = false
 		let resolveInterruptor: (r: () => void) => void = () => { }
@@ -1699,6 +1771,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 				if (preHook.decision === 'block') {
 					const blockReason = preHook.reason || `Tool ${toolName} was blocked by a PreToolUse hook.`
 					this._updateToolMessage(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: blockReason, name: toolName, content: blockReason, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, thought_signature: opts.thought_signature, parallelBatchId }, !!parallelMode)
+					this._emitAgentEvent({ type: 'tool_execution_finished', threadId, toolName, isError: true })
 					return {}
 				}
 				if (preHook.updatedInput && typeof preHook.updatedInput === 'object') {
@@ -1720,6 +1793,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 					if (!this.toolCallHistory[threadId]) this.toolCallHistory[threadId] = []
 					this.toolCallHistory[threadId].push({ name: toolName, params: toolParams, result: this._truncateToolResult(cached.resultStr), type: 'success', _paramsKey: this._getToolParamsKey(toolName, toolParams) })
 					if (this.toolCallHistory[threadId].length > MAX_TOOL_CALL_HISTORY_PER_THREAD) this.toolCallHistory[threadId] = this.toolCallHistory[threadId].slice(-MAX_TOOL_CALL_HISTORY_PER_THREAD)
+					this._emitAgentEvent({ type: 'tool_execution_finished', threadId, toolName, isError: false })
 					return {}
 				}
 			}
@@ -1818,6 +1892,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 
 			const errorMessage = getErrorMessage(error)
 			this._updateToolMessage(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, thought_signature: opts.thought_signature, parallelBatchId }, !!parallelMode)
+			this._emitAgentEvent({ type: 'tool_execution_finished', threadId, toolName, isError: true })
 			return {}
 		}
 		finally {
@@ -1943,6 +2018,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 
 		// Auto-update task status when tools complete successfully
 		this._updateTaskStatusFromToolExecution(threadId, toolName, 'success')
+		this._emitAgentEvent({ type: 'tool_execution_finished', threadId, toolName, isError: false })
 
 		return {}
 	};
@@ -1981,6 +2057,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 		// above just defines helpers, below starts the actual function
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
 		const { overridesOfModel } = this._settingsService.state
+		this._emitAgentEvent({ type: 'agent_run_started', threadId, chatMode })
 
 		let nMessagesSent = 0
 		let nPokesThisLoop = 0
@@ -2014,11 +2091,13 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 			shouldSendAnotherMessage = false
 			isRunningWhenEnd = undefined
 			nMessagesSent += 1
+			this._emitAgentEvent({ type: 'agent_turn_started', threadId, turnNumber: nMessagesSent })
 
 			// Safety check: prevent infinite loops in agent mode
 			const maxAgentIterations = this._settingsService.state.globalSettings.maxAgentIterations || 50
 			if (nMessagesSent > maxAgentIterations) {
 				voidDevWarn(`[chatThreadService] Agent mode exceeded maximum iterations (${maxAgentIterations}), stopping loop`)
+				this._emitAgentEvent({ type: 'agent_run_max_iterations', threadId, maxIterations: maxAgentIterations })
 				this._setStreamState(threadId, {
 					isRunning: undefined,
 					error: {
@@ -2048,7 +2127,12 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 				loadedSkills,
 				orchestrationResult,
 				compaction: this.state.allThreads[threadId]?.state.compaction,
+				usageAnchor: this.usageAnchorByThreadId.get(threadId),
 			})
+			// Snapshot of how many thread messages this prepare covered. Paired with
+			// the real usage returned by the LLM, it forms the usage anchor that lets
+			// later prepares count only the trailing delta instead of the whole thread.
+			const threadMessagesAtPrepare = chatMessages.length
 
 			// Fire PreCompact hook when a compaction actually ran on this turn, so
 			// hooks can archive the full pre-compaction transcript. Fired after the
@@ -2253,6 +2337,18 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 						voidDevLog(`[chatThreadService] onFinalMessage received - fullReasoning length: ${fullReasoning?.length ?? 0}, toolCalls: ${toolCalls?.length ?? 0}`)
 						if (usage) {
 							voidDevLog(`[chatThreadService] Token usage received:`, usage);
+							// Record the usage anchor: this call's measured promptTokens is
+							// ground truth for the `threadMessagesAtPrepare` messages that were
+							// on the wire, so later prepares only estimate the trailing delta.
+							if (usage.promptTokens > 0 && modelSelection) {
+								this.usageAnchorByThreadId.set(threadId, {
+									promptTokens: usage.promptTokens,
+									coveredThreadMessageCount: threadMessagesAtPrepare,
+									compactedChatMessageCountAtAnchor: this.state.allThreads[threadId]?.state.compaction?.compactedChatMessageCount ?? 0,
+									providerName: modelSelection.providerName,
+									modelName: modelSelection.modelName,
+								})
+							}
 							// Update token ratio for adaptive counting
 							if (tokenUsage?.used && usage.promptTokens) {
 								const { providerName, modelName } = modelSelection!;
@@ -2284,6 +2380,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 				}
 
 				this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: null, reactPhase: null }, interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken)) })
+				this._emitAgentEvent({ type: 'llm_request_started', threadId, messageCount: threadMessagesAtPrepare })
 				const llmRes = await messageIsDonePromise // wait for message to complete
 
 				// if something else started running in the meantime
@@ -2294,13 +2391,15 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 
 				// llm res aborted
 				if (llmRes.type === 'llmAborted') {
+					this._emitAgentEvent({ type: 'llm_aborted', threadId })
 					this._setStreamState(threadId, undefined)
+					this._emitAgentEvent({ type: 'agent_run_finished', threadId, outcome: 'aborted' })
 					return
 				}
 				// llm res error
 				else if (llmRes.type === 'llmError') {
 					const errorMsg = llmRes.error?.message || '';
-					const isContextError = errorMsg.includes('400') || errorMsg.includes('context') || errorMsg.includes('too long') || errorMsg.includes('token');
+					const isContextError = CONTEXT_LENGTH_ERROR_RE.test(errorMsg);
 
 					// Handle context length errors specifically by adjusting token estimation
 					if (isContextError && nAttempts < CHAT_RETRIES) {
@@ -2327,6 +2426,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 							modelSelection,
 							chatMode,
 							compaction: this.state.allThreads[threadId]?.state.compaction,
+							usageAnchor: this.usageAnchorByThreadId.get(threadId),
 						});
 
 						// Update messages and token usage for the retry
@@ -2389,12 +2489,15 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 						}
 
 						this._setStreamState(threadId, { isRunning: undefined, error })
+						this._emitAgentEvent({ type: 'llm_errored', threadId, errorMessage: error?.message ?? '' })
+						this._emitAgentEvent({ type: 'agent_run_finished', threadId, outcome: 'error' })
 						return
 					}
 				}
 
 				// llm res success
 				const { toolCalls, info, stopReason, usage: llmUsage } = llmRes
+				this._emitAgentEvent({ type: 'llm_response_received', threadId, toolCallCount: toolCalls?.length ?? 0, stopReason })
 
 									const responseLog = JSON.stringify({
 										hasToolCalls: !!toolCalls && toolCalls.length > 0,
@@ -2721,6 +2824,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 
 			// capture number of messages sent
 			this._metricsService.capture('Agent Loop Done', { nMessagesSent, chatMode })
+			this._emitAgentEvent({ type: 'agent_run_finished', threadId, outcome: 'done' })
 
 			// Process next queued message if any
 			if (!isRunningWhenEnd) {
@@ -3488,13 +3592,11 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 				return;
 			}
 		}
-		// MEMORY OPTIMIZATION: Limit queue size to prevent unbounded memory growth
+		// MEMORY OPTIMIZATION: Limit queue size to prevent unbounded memory growth.
+		// When full, drop the OLDEST message to make room, then queue the new one below.
 		if (this.messageQueue[threadId].length >= MAX_MESSAGE_QUEUE_PER_THREAD) {
-			voidDevWarn(`[Memory] Message queue for thread ${threadId} is full (${MAX_MESSAGE_QUEUE_PER_THREAD}). Dropping oldest message.`);
-			this.messageQueue[threadId].shift(); // Remove oldest message
-			// Notify UI that the queue changed
-			this._onDidChangeMessageQueue.fire({ threadId });
-			return;
+			voidDevWarn(`[Memory] Message queue for thread ${threadId} is full (${MAX_MESSAGE_QUEUE_PER_THREAD}). Dropping oldest message to make room.`);
+			this.messageQueue[threadId].shift(); // Remove oldest message to make room
 		}
 		this.messageQueue[threadId].push(message);
 		voidDevLog(`[chatThreadService] Queued message for thread ${threadId}. Queue length: ${this.messageQueue[threadId].length}`);
@@ -3969,6 +4071,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 		delete this.messageQueue[threadId];
 		delete this.taskPlans[threadId];
 		delete this.streamState[threadId];
+		this.usageAnchorByThreadId.delete(threadId);
 		// Drop this thread's plans so the per-thread plan maps don't leak.
 		this._toolsService.getPlanningService().clearPlan(threadId)
 		this._toolsService.getImplementationPlanningService().clearPlan(threadId)
@@ -4221,6 +4324,7 @@ private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool
 				chatMode,
 				loadedSkills: thread.state.loadedSkills,
 				compaction: thread.state.compaction,
+				usageAnchor: this.usageAnchorByThreadId.get(threadId),
 			})
 
 			// Update stream state with new token usage

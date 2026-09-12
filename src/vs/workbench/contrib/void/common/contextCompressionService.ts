@@ -6,6 +6,21 @@
 import { LLMChatMessage } from './sendLLMMessageTypes.js';
 import { ITokenCountingService } from './tokenCountingService.js';
 
+// Tools whose calls read file/system content (ported from a-coder-cli's
+// compaction file-op tracking). Their paths are surfaced in compression
+// summaries so the post-compression agent still knows what was inspected.
+const FILE_READ_TOOLS = new Set([
+	'read_file', 'outline_file', 'ls_dir', 'get_dir_tree',
+	'search_pathnames_only', 'search_for_files', 'search_in_file',
+	'read_lint_errors', 'fast_context', 'codebase_search',
+]);
+// Tools whose calls mutate the workspace — their paths are critical context.
+const FILE_MODIFY_TOOLS = new Set([
+	'create_file_or_folder', 'delete_file_or_folder', 'edit_file', 'edit_files', 'rewrite_file',
+]);
+// Param keys that may carry a filesystem path on tool calls.
+const PATH_PARAM_KEYS = ['uri', 'path', 'filepath', 'folder_uri', 'file_path'] as const;
+
 /**
  * Configuration for context compression with rolling window support
  */
@@ -64,6 +79,243 @@ export class ContextCompressionService {
 	constructor(
 		private tokenCountingService: ITokenCountingService
 	) { }
+
+	/**
+	 * Extract { id?, name } for every tool call in a message, across provider
+	 * formats (OpenAI tool_calls, Anthropic tool_use blocks, Gemini functionCall
+	 * parts). Returns an empty array for non-assistant / non-tool-call messages.
+	 */
+	private extractToolCallsFromMessage(msg: LLMChatMessage): Array<{ id?: string; name: string }> {
+		const calls: Array<{ id?: string; name: string }> = [];
+		if ('role' in msg && msg.role === 'assistant') {
+			const m = msg as LLMChatMessage & { tool_calls?: Array<{ id?: string; function?: { name?: string } }>; content?: unknown };
+			if (Array.isArray(m.tool_calls)) {
+				for (const tc of m.tool_calls) {
+					const name = tc.function?.name;
+					if (name) calls.push({ id: tc.id, name });
+				}
+			}
+			if (Array.isArray(m.content)) {
+				for (const part of m.content as Array<{ type?: string; id?: string; name?: string }>) {
+					if (part?.type === 'tool_use' && part.name) calls.push({ id: part.id, name: part.name });
+				}
+			}
+		}
+		if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionCall?: { name?: string } }> }).parts)) {
+			for (const part of (msg as LLMChatMessage & { parts?: Array<{ functionCall?: { name?: string } }> }).parts!) {
+				if (part?.functionCall?.name) calls.push({ name: part.functionCall.name });
+			}
+		}
+		return calls;
+	}
+
+	/** True when the message carries tool results (any provider format). */
+	private isToolResultMessage(msg: LLMChatMessage): boolean {
+		if ('role' in msg) {
+			if (msg.role === 'tool') return true;
+			if (msg.role === 'user' && Array.isArray((msg as LLMChatMessage & { content?: unknown }).content)) {
+				return ((msg as LLMChatMessage & { content: Array<{ type?: string }> }).content)
+					.some(part => part?.type === 'tool_result');
+			}
+		}
+		if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionResponse?: unknown }> }).parts)) {
+			return ((msg as LLMChatMessage & { parts: Array<{ functionResponse?: unknown }> }).parts)
+				.some(part => !!part?.functionResponse);
+		}
+		return false;
+	}
+
+	/** True when the assistant message carries tool calls (any provider format). */
+	private isAssistantWithToolCalls(msg: LLMChatMessage): boolean {
+		if ('role' in msg && msg.role === 'assistant') {
+			const m = msg as LLMChatMessage & { tool_calls?: unknown[]; content?: unknown };
+			if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) return true;
+			if (Array.isArray(m.content)) {
+				return (m.content as Array<{ type?: string }>).some(part => part?.type === 'tool_use');
+			}
+		}
+		if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionCall?: unknown }> }).parts)) {
+			return ((msg as LLMChatMessage & { parts: Array<{ functionCall?: unknown }> }).parts)
+				.some(part => !!part?.functionCall);
+		}
+		return false;
+	}
+
+	/**
+	 * Find the smallest valid cut index >= desiredIdx (ported from a-coder-cli's
+	 * findValidCutPoints): never orphan a tool result from its call, and never
+	 * drop an assistant tool-call sequence while keeping its results. If no
+	 * valid boundary exists, returns messages.length (nothing gets summarized).
+	 */
+	private findValidCutPoint(messages: LLMChatMessage[], desiredIdx: number): number {
+		for (let i = Math.max(1, desiredIdx); i < messages.length; i++) {
+			const msg = messages[i];
+			const prev = messages[i - 1];
+			// Invalid: cutting here orphans this tool result from its call.
+			if (this.isToolResultMessage(msg)) continue;
+			// Invalid: the previous (removed) message carries tool calls whose
+			// results live in the kept region.
+			if (this.isAssistantWithToolCalls(prev)) continue;
+			return i;
+		}
+		return messages.length;
+	}
+
+	/**
+	 * Remove tool calls and tool results that no longer have their counterpart
+	 * (ported from a-coder-cli compaction): providers reject tool results without
+	 * a preceding call AND assistant tool-calls without a following result. Runs
+	 * after any operation that drops messages from the middle of a sequence.
+	 */
+	private dropOrphanedToolMessages(messages: LLMChatMessage[]): LLMChatMessage[] {
+		// Pass 1: collect the ids/names that still exist on the other side.
+		const callIds = new Set<string>();
+		const resultIds = new Set<string>();
+		const callNames = new Set<string>();
+		const resultNames = new Set<string>();
+		for (const msg of messages) {
+			for (const call of this.extractToolCallsFromMessage(msg)) {
+				if (call.id) callIds.add(call.id);
+				callNames.add(call.name);
+			}
+			if ('role' in msg && msg.role === 'tool') {
+				const id = (msg as LLMChatMessage & { tool_call_id?: string }).tool_call_id;
+				if (id) resultIds.add(id);
+			} else if ('role' in msg && msg.role === 'user' && Array.isArray((msg as LLMChatMessage & { content?: unknown }).content)) {
+				for (const part of (msg as LLMChatMessage & { content: Array<{ type?: string; tool_use_id?: string }> }).content) {
+					if (part?.type === 'tool_result' && part.tool_use_id) resultIds.add(part.tool_use_id);
+				}
+			} else if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionResponse?: { name?: string } }> }).parts)) {
+				for (const part of (msg as LLMChatMessage & { parts: Array<{ functionResponse?: { name?: string } }> }).parts) {
+					if (part?.functionResponse?.name) resultNames.add(part.functionResponse.name);
+				}
+			}
+		}
+
+		// Pass 2: rebuild, keeping only paired calls/results.
+		const out: LLMChatMessage[] = [];
+		for (const msg of messages) {
+			if ('role' in msg && msg.role === 'assistant') {
+				const m = msg as LLMChatMessage & { tool_calls?: Array<{ id?: string; function?: { name?: string } }>; content?: unknown };
+				let hadCalls = false;
+				let keptCalls: Array<{ id?: string; function?: { name?: string } }> | undefined;
+				if (Array.isArray(m.tool_calls)) {
+					hadCalls = m.tool_calls.length > 0;
+					keptCalls = m.tool_calls.filter(tc => !!tc.id && resultIds.has(tc.id));
+				}
+				let hadToolUse = false;
+				let keptContent: Array<{ type?: string; id?: string }> | undefined;
+				if (Array.isArray(m.content)) {
+					const contentArr = m.content as Array<{ type?: string; id?: string }>;
+					hadToolUse = contentArr.some(part => part?.type === 'tool_use');
+					keptContent = contentArr.filter(part => part?.type !== 'tool_use' || (!!part.id && resultIds.has(part.id)));
+				}
+				if (hadCalls && keptCalls!.length === 0 && (!keptContent || keptContent.length === 0)) continue; // drop pure-call message
+				if (hadToolUse && keptContent && keptContent.length === 0 && keptCalls!.length === 0) continue; // drop pure-call message
+				out.push({
+					...msg,
+					...(keptCalls !== undefined ? { tool_calls: keptCalls } : {}),
+					...(keptContent !== undefined ? { content: keptContent } : {}),
+				} as LLMChatMessage);
+				continue;
+			}
+			if ('role' in msg && msg.role === 'tool') {
+				const id = (msg as LLMChatMessage & { tool_call_id?: string }).tool_call_id;
+				if (id && !callIds.has(id)) continue; // orphaned result
+				out.push(msg);
+				continue;
+			}
+			if ('role' in msg && msg.role === 'user' && Array.isArray((msg as LLMChatMessage & { content?: unknown }).content)) {
+				const contentArr = (msg as LLMChatMessage & { content: Array<{ type?: string; tool_use_id?: string }> }).content;
+				const hasResults = contentArr.some(part => part?.type === 'tool_result');
+				if (hasResults) {
+					const keptContent = contentArr.filter(part => part?.type !== 'tool_result' || (!!part.tool_use_id && callIds.has(part.tool_use_id)));
+					if (keptContent.length === 0) continue; // orphaned results only
+					out.push({ ...msg, content: keptContent } as LLMChatMessage);
+					continue;
+				}
+				out.push(msg);
+				continue;
+			}
+			if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionCall?: { name?: string } | unknown; functionResponse?: { name?: string } | unknown }> }).parts)) {
+				const parts = (msg as LLMChatMessage & { parts: Array<{ functionCall?: { name?: string }; functionResponse?: { name?: string } }> }).parts;
+				const isCall = (p: { functionCall?: unknown }) => !!p?.functionCall;
+				const isResponse = (p: { functionResponse?: unknown }) => !!p?.functionResponse;
+				if (parts.some(isCall) || parts.some(isResponse)) {
+					const keptParts = parts.filter(p => {
+						if (isCall(p)) return resultNames.has(p.functionCall!.name!);
+						if (isResponse(p)) return callNames.has(p.functionResponse!.name!);
+						return true;
+					});
+					if (keptParts.length === 0) continue;
+					out.push({ ...msg, parts: keptParts } as LLMChatMessage);
+					continue;
+				}
+				out.push(msg);
+				continue;
+			}
+			out.push(msg);
+		}
+		return out;
+	}
+
+	/**
+	 * Extract workspace file operations from tool calls in messages (ported from
+	 * a-coder-cli's compaction file-op tracking). Used to preserve file context
+	 * through compression summaries.
+	 */
+	private extractFileOperations(messages: LLMChatMessage[]): { filesRead: string[]; filesModified: string[] } {
+		const filesRead = new Set<string>();
+		const filesModified = new Set<string>();
+
+		for (const msg of messages) {
+			for (const call of this.extractToolCallsFromMessage(msg)) {
+				if (call.name === undefined) continue;
+				const isRead = FILE_READ_TOOLS.has(call.name);
+				const isModify = FILE_MODIFY_TOOLS.has(call.name);
+				if (!isRead && !isModify) continue;
+				// Find the path param from the message's raw call data.
+				const paramsObj = this.extractToolCallParams(msg, call);
+				let filePath: string | null = null;
+				if (paramsObj) {
+					for (const key of PATH_PARAM_KEYS) {
+						const val = (paramsObj as Record<string, unknown>)[key];
+						if (typeof val === 'string' && val.length > 0) { filePath = val; break; }
+					}
+				}
+				if (!filePath) continue;
+				(isModify ? filesModified : filesRead).add(filePath);
+			}
+		}
+		return { filesRead: Array.from(filesRead), filesModified: Array.from(filesModified) };
+	}
+
+	/** Pull the params object for a specific tool call out of its message. */
+	private extractToolCallParams(msg: LLMChatMessage, call: { id?: string; name: string }): Record<string, unknown> | null {
+		if ('role' in msg && msg.role === 'assistant') {
+			const m = msg as LLMChatMessage & { tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>; content?: unknown };
+			if (Array.isArray(m.tool_calls)) {
+				for (const tc of m.tool_calls) {
+					if (tc.function?.name === call.name && (!call.id || tc.id === call.id)) {
+						try { return JSON.parse(tc.function.arguments ?? '{}'); } catch { return null; }
+					}
+				}
+			}
+			if (Array.isArray(m.content)) {
+				for (const part of m.content as Array<{ type?: string; id?: string; name?: string; input?: Record<string, unknown> }>) {
+					if (part?.type === 'tool_use' && part.name === call.name && (!call.id || part.id === call.id)) {
+						return part.input ?? null;
+					}
+				}
+			}
+		}
+		if ('parts' in msg && Array.isArray((msg as LLMChatMessage & { parts?: Array<{ functionCall?: { name?: string; args?: Record<string, unknown> } }> }).parts)) {
+			for (const part of (msg as LLMChatMessage & { parts?: Array<{ functionCall?: { name?: string; args?: Record<string, unknown> } }> }).parts!) {
+				if (part?.functionCall?.name === call.name) return part.functionCall.args ?? null;
+			}
+		}
+		return null;
+	}
 
 	/**
 	 * Compress messages to fit within target token limit using rolling window approach
@@ -160,6 +412,8 @@ export class ContextCompressionService {
 				recentTargetTokens,
 				fullConfig.emergencyKeepLastN
 			);
+			// Dropping messages mid-sequence can orphan tool calls/results — clean up.
+			processedRecent = this.dropOrphanedToolMessages(processedRecent);
 			currentTokens = await this.tokenCountingService.countMessagesTokensAsync(processedRecent, modelName);
 		}
 
@@ -207,6 +461,8 @@ export class ContextCompressionService {
 		if (finalTokens > targetTokens) {
 			console.warn(`[ContextCompression] Still over target after compression (${finalTokens} > ${targetTokens}), applying emergency truncation`);
 			finalMessages = await this.emergencyCompress(finalMessages, modelName, targetTokens, fullConfig.emergencyKeepLastN);
+			// Dropping messages mid-sequence can orphan tool calls/results — clean up.
+			finalMessages = this.dropOrphanedToolMessages(finalMessages);
 			finalTokens = await this.tokenCountingService.countMessagesTokensAsync(finalMessages, modelName);
 		}
 
@@ -275,14 +531,14 @@ export class ContextCompressionService {
 				if (idx > 0) adjustedCritical.add(idx - 1);
 			}
 
-			const splitIdx = splitPoint(contentMessages.length);
+			const splitIdx = this.findValidCutPoint(contentMessages, splitPoint(contentMessages.length));
 			const recentMessages = contentMessages.slice(splitIdx);
 			const oldMessages = contentMessages.slice(0, splitIdx);
 
 			return { systemMessage, recentMessages, oldMessages, criticalMessages: adjustedCritical };
 		} else {
 			// No system message, all messages are content
-			const splitIdx = splitPoint(messages.length);
+			const splitIdx = this.findValidCutPoint(messages, splitPoint(messages.length));
 			const recentMessages = messages.slice(splitIdx);
 			const oldMessages = messages.slice(0, splitIdx);
 
@@ -400,6 +656,8 @@ export class ContextCompressionService {
 			return currentMessages.slice(-minKeepMessages);
 		}
 
+		// Dropping messages mid-sequence can orphan tool calls/results — clean up.
+		currentMessages = this.dropOrphanedToolMessages(currentMessages);
 		return currentMessages;
 	}
 
@@ -457,9 +715,21 @@ export class ContextCompressionService {
 			}
 		}
 
+		// FILE-OP TRACKING (ported from a-coder-cli compaction): preserve which
+		// files were read and modified in the summarized region so the agent keeps
+		// its workspace bearings after compression.
+		const { filesRead, filesModified } = this.extractFileOperations(oldMessages);
+		const fileOpLines: string[] = [];
+		if (filesModified.length > 0) {
+			fileOpLines.push(`FILES MODIFIED: ${filesModified.join(', ')}`);
+		}
+		if (filesRead.length > 0) {
+			fileOpLines.push(`FILES READ: ${filesRead.join(', ')}`);
+		}
+
 		const summaryText = summaryParts.length > 0
-			? `[PREVIOUS CONVERSATION SUMMARY - ${oldMessages.length} messages condensed. This is background context from earlier in the conversation, NOT a new request from the user. Do not respond to it directly.]\n\n${summaryParts.join('\n')}\n\n[End of summary]`
-			: '[Previous conversation context condensed. This is background context, NOT a new request from the user.]';
+			? `[PREVIOUS CONVERSATION SUMMARY - ${oldMessages.length} messages condensed. This is background context from earlier in the conversation, NOT a new request from the user. Do not respond to it directly.]${fileOpLines.length > 0 ? `\n\n${fileOpLines.join('\n')}` : ''}\n\n${summaryParts.join('\n')}\n\n[End of summary]`
+			: `[Previous conversation context condensed. This is background context, NOT a new request from the user.]${fileOpLines.length > 0 ? ` ${fileOpLines.join('. ')}` : ''}`;
 
 		// Return as a user-role message. This is only used as a fallback for
 		// separated-system providers (Anthropic/Gemini) where the system message

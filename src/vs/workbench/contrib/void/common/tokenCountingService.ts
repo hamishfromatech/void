@@ -21,6 +21,12 @@ export interface ITokenCountingService {
 	countTextTokensAsync(text: string, modelName: string): Promise<number>;
 	countMessageTokensAsync(message: LLMChatMessage, modelName: string): Promise<number>;
 	countMessagesTokensAsync(messages: LLMChatMessage[], modelName: string): Promise<number>;
+	/**
+	 * Synchronous chars/4 estimation of message tokens — no IPC, no ratio
+	 * correction. Used for cheap estimates of small trailing deltas on top of a
+	 * real usage anchor; NOT a substitute for a full accurate count.
+	 */
+	estimateMessagesTokensFast(messages: ReadonlyArray<{ content: string | ReadonlyArray<string | { text?: string }> }>): number;
 	getContextWindowSize(modelName: string): number;
 	getRemainingTokens(messages: LLMChatMessage[], modelName: string): number;
 	getRemainingTokensAsync(messages: LLMChatMessage[], modelName: string): Promise<number>;
@@ -469,6 +475,26 @@ export class TokenCountingService extends Disposable implements ITokenCountingSe
 		this._cacheTimestamps.set(fullKey, Date.now());
 	}
 
+
+	/**
+	 * Fast synchronous estimate for small message deltas (see interface doc).
+	 * Follows the file-wide CHARS_PER_TOKEN = 4 convention.
+	 */
+	public estimateMessagesTokensFast(messages: ReadonlyArray<{ content: string | ReadonlyArray<string | { text?: string }> }>): number {
+		let chars = 0;
+		for (const message of messages) {
+			if (typeof message.content === 'string') {
+				chars += message.content.length;
+			} else if (Array.isArray(message.content)) {
+				for (const part of message.content) {
+					if (typeof part === 'string') chars += part.length;
+					else chars += part?.text?.length ?? 0;
+				}
+			}
+		}
+		// ~4 chars/token plus a small per-message and per-request overhead
+		return Math.ceil(chars / 4) + messages.length * 4 + 3;
+	}
 
 	/**
 	 * Internal helper: character-based estimate for messages (fallback).
